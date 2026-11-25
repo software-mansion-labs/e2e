@@ -1,0 +1,21 @@
+{
+  "name": "@e2e-dev/argent-testbed",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Runs the SwiftUI example's locator tests on an Argent Cloud simulator",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build:app": "xcodebuild build -project ../../examples/with-swiftui/HelloApp.xcodeproj -scheme HelloApp -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath build CODE_SIGNING_ALLOWED=NO -quiet",
+    "test": "node node_modules/e2e/dist/cli/bin.js run"
+  },
+  "dependencies": {
+    "@e2e-dev/argent": "workspace:*",
+    "@e2e-dev/mobile": "workspace:*",
+    "e2e": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "typescript": "7.0.2"
+  }
+}
