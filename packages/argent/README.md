@@ -10,10 +10,12 @@ import { argent } from '@e2e-dev/argent';
 const engine = mobile({ platform: 'ios', device: argent() });
 ```
 
-Set `ARGENT_CLOUD_API_KEY` in the run environment and put `sim-remote` on `PATH`
-(or set `SIM_REMOTE_BIN`). The provider runs on macOS and Linux and needs no Xcode.
-On Linux it also needs libplist's `plistutil` 2.3 or newer (Debian and Ubuntu package
-`libplist-utils`).
+Set `ARGENT_CLOUD_API_KEY` in the run environment and put
+[`sim-remote`](https://github.com/software-mansion/sim-remote-releases/releases/latest) on
+`PATH` (or set `SIM_REMOTE_BIN`). The provider runs on macOS and Linux and needs no Xcode.
+On Linux it also needs libplist's `plistutil` 2.3 or newer, as Argent Cloud's Maestro
+support does. Ubuntu 24.04's `libplist-utils` package has it; Ubuntu 22.04 and Debian 12
+ship 2.2.0, which is too old.
 
 ## Options
 
