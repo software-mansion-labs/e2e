@@ -214,7 +214,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** The app's bundle id, through the lease's plutil shim: the Mac's plutil or libplist. */
+/** The app's bundle id, through the lease's plutil shim: the Mac's plutil or sim-remote's. */
 async function bundleId(app: string, env: NodeJS.ProcessEnv): Promise<string> {
   const { stdout } = await exec('plutil', ['-extract', 'CFBundleIdentifier', 'raw', path.join(app, 'Info.plist')], { env });
   return stdout.trim();

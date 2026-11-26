@@ -116,7 +116,7 @@ function simRemote(args, options = {}) {
 }
 
 function plistJson(file) {
-  // The plutil shim on PATH: the Mac's own, or libplist elsewhere.
+  // The plutil shim on PATH: the Mac's own, or sim-remote's elsewhere.
   const result = spawnSync('plutil', ['-convert', 'json', '-o', '-', file], { encoding: 'utf8' });
   if (result.status !== 0) throw new Error(`cannot read ${file}: ${result.stderr.trim()}`);
   return JSON.parse(result.stdout);

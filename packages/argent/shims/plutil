@@ -1,8 +1,8 @@
 #!/bin/sh
-# plutil shim: the Mac's own plutil when there is one. Elsewhere, libplist's
-# plistutil through sim-remote's plutil shim (conversions to and from json,
-# xml1 and binary1, from files or stdin), plus the `-extract KEY raw` form
-# agent-device reads app executables with.
+# plutil shim: the Mac's own plutil when there is one. Elsewhere, sim-remote's
+# plutil shim (conversions to and from json, xml1 and binary1, from files or
+# stdin), plus the `-extract KEY raw` form agent-device reads app executables
+# with.
 set -eu
 [ -n "${ARGENT_SHIM_LOG:-}" ] && echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) plutil $*" >>"$ARGENT_SHIM_LOG"
 [ -x /usr/bin/plutil ] && exec /usr/bin/plutil "$@"
