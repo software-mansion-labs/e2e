@@ -1,0 +1,10 @@
+#!/bin/sh
+# xcrun shim: simulator commands go to Argent Cloud through sim-remote's own
+# xcrun shim; everything else (tool lookups, SDK queries for the runner build)
+# runs on the local Xcode, with these shims off PATH.
+set -eu
+[ -n "${ARGENT_SHIM_LOG:-}" ] && echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) xcrun $*" >>"$ARGENT_SHIM_LOG"
+case "${1:-}" in
+    simctl | devicectl) exec "$ARGENT_SIM_REMOTE_SHIMS/xcrun" "$@" ;;
+esac
+PATH=$ARGENT_HOST_PATH exec /usr/bin/xcrun "$@"

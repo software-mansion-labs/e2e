@@ -1,0 +1,311 @@
+#!/usr/bin/env node
+// xcodebuild shim: runs agent-device's XCTest runner on an Argent Cloud
+// simulator, behind the local port agent-device polls.
+//
+// agent-device builds its runner with `xcodebuild build-for-testing` and then
+// starts it with `xcodebuild test-without-building -xctestrun <file>
+// -destination ...id=<udid>`, holding the process until it is done with the
+// runner. The build runs here on the real xcodebuild. The run is replaced:
+//
+// The build is replaced too: agent-device's release runner, which the
+// provider downloads into ARGENT_RUNNER_APP, is laid out in the derived data
+// path as if xcodebuild had built it, so no Xcode is needed on this machine.
+//
+//   1. install the runner and its UI target app on the remote simulator;
+//   2. write an XCTest configuration naming their remote paths (a bare
+//      `simctl launch` of a runner has none, and XCUIApplication refuses to
+//      start without a target application) and stage it on the runner host;
+//   3. launch the runner with the xctestrun's environment, a remote port, and
+//      the XCTest runtime on its dyld fallback paths;
+//   4. wait for its listener, then forward agent-device's local port to it;
+//   5. stay alive until stopped, then tear the tunnel and the runner down.
+//
+// Anything else is handed to the real xcodebuild with the shims off PATH.
+import { spawn, spawnSync } from 'node:child_process';
+import { randomBytes, randomInt } from 'node:crypto';
+import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const env = process.env;
+const SIM_REMOTE = env.ARGENT_SIM_REMOTE || 'sim-remote';
+const HOST_PATH = env.ARGENT_HOST_PATH || env.PATH;
+// Xcode's iPhoneSimulator platform on the runner host, for the XCTest runtime.
+const REMOTE_SIM_DEV = env.ARGENT_REMOTE_XCODE_SIM_DEV || '/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer';
+const STARTUP_SECONDS = 90;
+const REAL_XCODEBUILD = env.ARGENT_REAL_XCODEBUILD || '/usr/bin/xcodebuild';
+
+const log = (line) => {
+  process.stdout.write(`argent-xcodebuild: ${line}\n`);
+  if (env.ARGENT_SHIM_LOG) appendFileSync(env.ARGENT_SHIM_LOG, `${new Date().toISOString()} xcodebuild[${process.pid}] ${line}\n`);
+};
+if (!env.ARGENT_XCODEBUILD_JANITOR) log(`argv: ${process.argv.slice(2).join(' ')}`);
+
+function delegate() {
+  const args = process.argv.slice(2);
+  if (args.includes('build-for-testing') && env.ARGENT_RUNNER_APP) return buildFromRelease(args);
+  if (!existsSync(REAL_XCODEBUILD)) {
+    // Without Xcode here, answer what agent-device asks of the runner host's Xcode by its version.
+    if (args[0] === '-version' && env.ARGENT_XCODE_VERSION) {
+      process.stdout.write(`Xcode ${env.ARGENT_XCODE_VERSION}\nBuild version ${env.ARGENT_XCODE_BUILD ?? 'unknown'}\n`);
+      process.exit(0);
+    }
+    log(`no local Xcode for: xcodebuild ${args.join(' ')}`);
+    process.exit(72);
+  }
+  // Every simulator agent-device sees is in the cloud, so the local Xcode cannot find one by id:
+  // a build for one becomes a build for any simulator, which is what the remote device runs.
+  const forwarded = args.map((arg) => (/^platform=iOS Simulator,.*\bid=/.test(arg) ? 'generic/platform=iOS Simulator' : arg));
+  const real = spawnSync(REAL_XCODEBUILD, forwarded, { stdio: 'inherit', env: { ...env, PATH: HOST_PATH } });
+  log(`real xcodebuild exited ${real.status ?? real.signal}`);
+  if (real.error) {
+    process.stderr.write(`argent-xcodebuild: ${real.error.message}\n`);
+    process.exit(1);
+  }
+  process.exit(real.status ?? 1);
+}
+
+/** Lays out the release runner where `build-for-testing` would have put the built one. */
+function buildFromRelease(args) {
+  const derived = argValue(args, '-derivedDataPath');
+  if (!derived) {
+    log('build-for-testing without -derivedDataPath');
+    process.exit(64);
+  }
+  // agent-device names its products directory with SYMROOT and searches it for the xctestrun.
+  const symroot = args.find((arg) => arg.startsWith('SYMROOT='))?.slice('SYMROOT='.length);
+  const products = symroot ?? path.join(derived, 'Build', 'Products');
+  const runner = path.join(products, 'Debug-iphonesimulator', 'AgentDeviceRunnerUITests-Runner.app');
+  rmSync(products, { recursive: true, force: true });
+  mkdirSync(path.dirname(runner), { recursive: true });
+  cpSync(env.ARGENT_RUNNER_APP, runner, { recursive: true, verbatimSymlinks: true });
+  // The release runner is its own UI target app, as on Limrun.
+  writeFileSync(path.join(products, 'AgentDeviceRunner_AgentDeviceRunnerUITests_iphonesimulator.xctestrun'), `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>AgentDeviceRunnerUITests</key>
+\t<dict>
+\t\t<key>BlueprintName</key><string>AgentDeviceRunnerUITests</string>
+\t\t<key>ProductModuleName</key><string>AgentDeviceRunnerUITests</string>
+\t\t<key>IsUITestBundle</key><true/>
+\t\t<key>TestHostPath</key><string>__TESTROOT__/Debug-iphonesimulator/AgentDeviceRunnerUITests-Runner.app</string>
+\t\t<key>TestBundlePath</key><string>__TESTHOST__/PlugIns/AgentDeviceRunnerUITests.xctest</string>
+\t\t<key>UITargetAppPath</key><string>__TESTROOT__/Debug-iphonesimulator/AgentDeviceRunnerUITests-Runner.app</string>
+\t\t<key>OnlyTestIdentifiers</key><array><string>RunnerTests/testCommand</string></array>
+\t\t<key>EnvironmentVariables</key><dict/>
+\t</dict>
+\t<key>__xctestrun_metadata__</key>
+\t<dict>
+\t\t<key>FormatVersion</key><integer>1</integer>
+\t</dict>
+</dict>
+</plist>
+`);
+  log(`laid out the release runner in ${products}`);
+  process.exit(0);
+}
+
+function simRemote(args, options = {}) {
+  const result = spawnSync(SIM_REMOTE, args, { encoding: 'utf8', env: { ...env, ...options.env }, timeout: options.timeoutMs ?? 300_000, maxBuffer: 64 * 1024 * 1024 });
+  if (result.status !== 0 && !options.allowFailure) {
+    throw new Error(`sim-remote ${args.join(' ')} failed (${result.status ?? result.signal ?? result.error?.message}): ${(result.stderr || result.stdout || '').trim()}`);
+  }
+  return result;
+}
+
+function plistJson(file) {
+  // The plutil shim on PATH: the Mac's own, or sim-remote's elsewhere.
+  const result = spawnSync('plutil', ['-convert', 'json', '-o', '-', file], { encoding: 'utf8' });
+  if (result.status !== 0) throw new Error(`cannot read ${file}: ${result.stderr.trim()}`);
+  return JSON.parse(result.stdout);
+}
+
+function argValue(args, flag) {
+  const index = args.indexOf(flag);
+  return index >= 0 ? args[index + 1] : undefined;
+}
+
+/** The test target whose environment carries agent-device's runner port, in either xctestrun format. */
+function runnerTarget(xctestrun) {
+  const targets = Array.isArray(xctestrun.TestConfigurations)
+    ? xctestrun.TestConfigurations.flatMap((configuration) => configuration.TestTargets ?? [])
+    : Object.entries(xctestrun).filter(([key]) => !key.startsWith('__')).map(([, value]) => value);
+  return targets.find((target) => target?.EnvironmentVariables?.AGENT_DEVICE_RUNNER_PORT);
+}
+
+/** Undoes what the state file records: the tunnel, the runner, the log stream. Idempotent. */
+function cleanup(statePath) {
+  if (!existsSync(statePath)) return;
+  const current = JSON.parse(readFileSync(statePath, 'utf8'));
+  // Every step tolerates its target being gone, and the state goes last with the work directory,
+  // so a janitor that finds the shim killed mid-teardown redoes all of it.
+  if (current.tunnel) simRemote(['forward', 'stop', String(current.tunnel)], { allowFailure: true, timeoutMs: 20_000 });
+  if (current.launched) simRemote(['simctl', 'terminate', current.udid, current.runnerBundleId], { allowFailure: true, timeoutMs: 20_000 });
+  if (current.stream) try { process.kill(current.stream, 'SIGTERM'); } catch { /* already gone */ }
+  rmSync(current.work, { recursive: true, force: true });
+}
+
+// Janitor mode: agent-device stops the runner by killing this process group, which can be a SIGKILL.
+// A detached copy waits for the shim to die and repeats the teardown it may not have finished.
+if (env.ARGENT_XCODEBUILD_JANITOR) {
+  const [watched, statePath] = env.ARGENT_XCODEBUILD_JANITOR.split(':');
+  const timer = setInterval(() => {
+    try { process.kill(Number(watched), 0); } catch {
+      clearInterval(timer);
+      cleanup(statePath);
+    }
+  }, 1000);
+} else {
+  await main();
+}
+
+async function main() {
+const args = process.argv.slice(2);
+const xctestrunPath = argValue(args, '-xctestrun');
+if (!args.includes('test-without-building') || !xctestrunPath) delegate();
+const xctestrun = plistJson(xctestrunPath);
+const target = runnerTarget(xctestrun);
+if (!target) delegate();
+
+const destination = argValue(args, '-destination') ?? '';
+const udid = /(?:^|,)id=([^,]+)/.exec(destination)?.[1];
+if (!udid) throw new Error(`no simulator id in -destination '${destination}'`);
+
+const testRoot = path.dirname(xctestrunPath);
+const runnerApp = target.TestHostPath.replaceAll('__TESTROOT__', testRoot);
+const resolve = (value) => value.replaceAll('__TESTROOT__', testRoot).replaceAll('__TESTHOST__', runnerApp);
+const targetApp = target.UITargetAppPath ? resolve(target.UITargetAppPath) : undefined;
+const bundleId = (app) => plistJson(path.join(app, 'Info.plist')).CFBundleIdentifier;
+const runnerInfo = plistJson(path.join(runnerApp, 'Info.plist'));
+const runnerBundleId = target.TestHostBundleIdentifier ?? runnerInfo.CFBundleIdentifier;
+const runnerProcess = runnerInfo.CFBundleExecutable;
+const targetBundleId = targetApp ? bundleId(targetApp) : runnerBundleId;
+const testBundle = path.basename(resolve(target.TestBundlePath));
+const runnerEnv = target.EnvironmentVariables;
+const localPort = runnerEnv.AGENT_DEVICE_RUNNER_PORT;
+
+const work = mkdtempSync(path.join(tmpdir(), 'argent-xcodebuild-'));
+const state = { work, udid, runnerBundleId, tunnel: undefined, stream: undefined, staged: undefined, launched: false };
+const statePath = path.join(work, 'state.json');
+const saveState = () => writeFileSync(statePath, JSON.stringify(state));
+saveState();
+spawn(process.execPath, [process.argv[1]], { detached: true, stdio: 'ignore', env: { ...env, ARGENT_XCODEBUILD_JANITOR: `${process.pid}:${statePath}` } }).unref();
+let stopping = false;
+const stop = (code) => {
+  if (stopping) return;
+  stopping = true;
+  try { cleanup(statePath); } finally { process.exit(code); }
+};
+process.on('SIGTERM', () => stop(143));
+process.on('SIGINT', () => stop(130));
+process.on('SIGHUP', () => stop(129));
+try {
+  await run();
+} catch (error) {
+  log(error instanceof Error ? error.message : String(error));
+  stop(1);
+}
+
+async function run() {
+  for (const app of new Set([targetApp, runnerApp].filter(Boolean))) {
+    log(`installing ${path.basename(app)} on ${udid}`);
+    simRemote(['simctl', 'install', udid, app]);
+  }
+  const apps = JSON.parse(spawnSync('plutil', ['-convert', 'json', '-o', '-', '-'], { input: simRemote(['simctl', 'listapps', udid]).stdout, encoding: 'utf8' }).stdout);
+  const remoteRunner = apps[runnerBundleId]?.Path;
+  const remoteTarget = apps[targetBundleId]?.Path;
+  if (!remoteRunner || !remoteTarget) throw new Error(`the runner apps are not on ${udid} after install`);
+
+  // Stage the configuration through the orchestrator's per-device upload directory, under the runner host's home.
+  const home = remoteRunner.split('/Library/Developer/CoreSimulator/')[0];
+  const configName = `agent-device-${randomBytes(6).toString('hex')}.xctestconfiguration`;
+  const configFile = path.join(work, configName);
+  writeFileSync(configFile, xctestConfiguration({
+    testBundle: path.join(remoteRunner, 'PlugIns', testBundle),
+    targetApp: remoteTarget,
+    targetBundleId,
+    module: target.ProductModuleName ?? path.basename(testBundle, '.xctest'),
+  }));
+  simRemote(['dylib', 'add', udid, configFile]);
+  const remoteConfig = `${home}/.radon-orchestrator/spawn/${udid}/dylibs/${configName}`;
+
+  const streamLog = path.join(work, 'runner.log');
+  const out = openSync(streamLog, 'a');
+  const stream = spawn(SIM_REMOTE, ['spawn', udid, '--', 'log', 'stream', '--level', 'info', '--style', 'compact', '--predicate', `process == "${runnerProcess}" AND eventMessage CONTAINS "AGENT_DEVICE_RUNNER_"`], { stdio: ['ignore', out, out], env });
+  closeSync(out);
+  state.stream = stream.pid;
+  saveState();
+  await sleep(3000);
+
+  const childEnv = {};
+  for (const [name, value] of Object.entries(runnerEnv)) {
+    if (name !== 'DYLD_INSERT_LIBRARIES') childEnv[`SIMCTL_CHILD_${name}`] = value;
+  }
+  let remotePort;
+  for (let attempt = 1; attempt <= 3 && remotePort === undefined; attempt++) {
+    const port = randomInt(20_000, 61_000);
+    const offset = readFileSync(streamLog, 'utf8').length;
+    log(`launching ${runnerBundleId} on remote port ${port}`);
+    state.launched = true;
+    saveState();
+    simRemote(['simctl', 'launch', '--terminate-running-process', udid, runnerBundleId], {
+      env: {
+        ...childEnv,
+        SIMCTL_CHILD_AGENT_DEVICE_RUNNER_PORT: String(port),
+        SIMCTL_CHILD_AGENT_DEVICE_RUNNER_BIND_IP: '127.0.0.1',
+        SIMCTL_CHILD_XCTestConfigurationFilePath: remoteConfig,
+        SIMCTL_CHILD_DYLD_FALLBACK_LIBRARY_PATH: `${REMOTE_SIM_DEV}/usr/lib`,
+        SIMCTL_CHILD_DYLD_FALLBACK_FRAMEWORK_PATH: `${REMOTE_SIM_DEV}/Library/Frameworks`,
+      },
+    });
+    for (let second = 0; second < STARTUP_SECONDS; second++) {
+      const seen = readFileSync(streamLog, 'utf8').slice(offset);
+      if (seen.includes('AGENT_DEVICE_RUNNER_LISTENER_READY')) { remotePort = port; break; }
+      if (seen.includes('AGENT_DEVICE_RUNNER_LISTENER_FAILED')) { log(`the runner could not listen on ${port}; trying another port`); break; }
+      await sleep(1000);
+    }
+    if (remotePort === undefined && !readFileSync(streamLog, 'utf8').slice(offset).includes('LISTENER_FAILED')) {
+      log(`the runner logged no listener within ${STARTUP_SECONDS}s; last stream lines:\n${readFileSync(streamLog, 'utf8').split('\n').slice(-15).join('\n')}`);
+      return stop(1);
+    }
+  }
+  if (remotePort === undefined) return stop(1);
+
+  for (let attempt = 0; ; attempt++) {
+    const forwarded = simRemote(['forward', 'start', udid, `${localPort}:${remotePort}`], { allowFailure: true, timeoutMs: 30_000 });
+    if (forwarded.status === 0) break;
+    if (attempt === 9) throw new Error(`cannot forward 127.0.0.1:${localPort}: ${forwarded.stderr.trim()}`);
+    await sleep(1000);
+  }
+  state.tunnel = localPort;
+  saveState();
+  log(`runner ready: 127.0.0.1:${localPort} -> ${udid} 127.0.0.1:${remotePort}`);
+
+  // Serve until stopped. The daemon that started this owns it; outlive it and nothing will stop us.
+  const parent = process.ppid;
+  setInterval(() => {
+    try { process.kill(parent, 0); } catch { log('parent exited'); stop(0); }
+  }, 1000);
+}
+}
+
+/**
+ * An XCTest configuration naming the remote runner's test bundle and target app: an
+ * NSKeyedArchiver archive of XCTestConfiguration, made once with Xcode and kept as XML.
+ */
+function xctestConfiguration({ testBundle, targetApp, targetBundleId, module }) {
+  const xml = (value) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+  const template = readFileSync(new URL('xctestconfiguration.plist', import.meta.url), 'utf8');
+  return template
+    .replace('__TEST_BUNDLE_URL__', xml(pathToFileURL(testBundle).href))
+    .replace('__TARGET_APP_PATH__', xml(targetApp))
+    .replace('__TARGET_BUNDLE_ID__', xml(targetBundleId))
+    .replace('__MODULE_NAME__', xml(module))
+    .replace('__SESSION_UUID__', randomBytes(16).toString('base64'));
+}
+
+function sleep(ms) {
+  return new Promise((done) => setTimeout(done, ms));
+}

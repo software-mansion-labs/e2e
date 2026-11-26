@@ -1,0 +1,25 @@
+#!/bin/sh
+# plutil shim: the Mac's own plutil when there is one. Elsewhere, sim-remote's
+# plutil shim (conversions to and from json, xml1 and binary1, from files or
+# stdin), plus the `-extract KEY raw` form agent-device reads app executables
+# with.
+set -eu
+[ -n "${ARGENT_SHIM_LOG:-}" ] && echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) plutil $*" >>"$ARGENT_SHIM_LOG"
+[ -x /usr/bin/plutil ] && exec /usr/bin/plutil "$@"
+if [ "${1:-}" = -extract ] && [ "${3:-}" = raw ]; then
+    key=$2
+    shift 3
+    [ "${1:-}" = -o ] && shift 2
+    "$ARGENT_SIM_REMOTE_SHIMS/plutil" -convert json -o - "$1" | node -e '
+        let text = "";
+        process.stdin.on("data", (chunk) => { text += chunk; }).on("end", () => {
+            const value = process.argv[1].split(".").reduce((node, part) => (node === null || typeof node !== "object" ? undefined : node[part]), JSON.parse(text));
+            if (value === undefined || (typeof value === "object" && value !== null)) {
+                process.stderr.write(`No value at that key path or invalid key path: ${process.argv[1]}\n`);
+                process.exit(1);
+            }
+            process.stdout.write(`${value}\n`);
+        });' "$key"
+    exit
+fi
+exec "$ARGENT_SIM_REMOTE_SHIMS/plutil" "$@"
